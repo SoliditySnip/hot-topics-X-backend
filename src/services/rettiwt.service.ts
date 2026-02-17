@@ -110,5 +110,61 @@ export async function fetchUserDetails(username: string) {
     };
 }
 
+/**
+ * Fetch a single tweet's details by ID.
+ * Used for refreshing engagement on older tweets.
+ */
+export async function fetchTweetDetails(tweetId: string) {
+    const tweet = await keyPool.execute(
+        (rettiwt) => rettiwt.tweet.details(tweetId),
+        `tweet.details(${tweetId})`
+    ) as any;
+
+    if (!tweet) return null;
+
+    return {
+        tweetId: tweet.id,
+        content: tweet.fullText,
+        postedAt: tweet.createdAt,
+        lang: tweet.lang,
+        url: `https://x.com/${tweet.tweetBy?.userName}/status/${tweet.id}`,
+
+        // Author info
+        authorId: tweet.tweetBy?.id || '',
+        authorUsername: tweet.tweetBy?.userName || '',
+        authorDisplayName: tweet.tweetBy?.fullName || '',
+        authorFollowers: tweet.tweetBy?.followersCount || 0,
+        authorIsVerified: tweet.tweetBy?.isVerified || false,
+        authorProfileImage: tweet.tweetBy?.profileImage || '',
+
+        // Engagement metrics
+        likes: tweet.likeCount || 0,
+        retweets: tweet.retweetCount || 0,
+        replies: tweet.replyCount || 0,
+        quotes: tweet.quoteCount || 0,
+        views: tweet.viewCount || 0,
+        bookmarks: tweet.bookmarkCount || 0,
+
+        // Entities
+        hashtags: tweet.entities?.hashtags || [],
+        mentionedUsers: tweet.entities?.mentionedUsers || [],
+        urls: tweet.entities?.urls || [],
+
+        // Tweet type flags
+        isRetweet: !!tweet.retweetedTweet,
+        isReply: !!tweet.replyTo,
+        isQuote: !!tweet.quoted,
+
+        // The original retweeted content (if this is a RT)
+        retweetedContent: tweet.retweetedTweet?.fullText || null,
+        retweetedAuthor: tweet.retweetedTweet?.tweetBy?.userName || null,
+
+        // The quoted tweet content (if this is a QT)
+        quotedContent: tweet.quoted?.fullText || null,
+        quotedAuthor: tweet.quoted?.tweetBy?.userName || null,
+    };
+}
+
 export type FetchedTweet = Awaited<ReturnType<typeof fetchListTweets>>[number];
 export type FetchedUser = Awaited<ReturnType<typeof fetchListMembers>>[number];
+

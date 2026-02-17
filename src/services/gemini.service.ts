@@ -26,15 +26,14 @@ function getGenAI(): GoogleGenerativeAI {
     return genAI;
 }
 
-// Model fallback chain
+// Model fallback chain — only confirmed working models
 const MODEL_CHAIN = [
-    'gemini-2.0-flash',         // Switched back to 2.0-flash (most reliable for JSON)
-    'gemini-3-flash-preview',   // Fallback
-    'gemini-2.5-flash',
+    'gemini-2.0-flash',         // Primary: Most reliable for JSON
+    'gemini-3-flash-preview',   // Fallback: Powerful, needs high token limit
 ];
 
-const MAX_RETRIES = 2;
-const BASE_RETRY_DELAY_MS = 2000;
+const MAX_RETRIES = 3;           // 3 attempts per model
+const BASE_RETRY_DELAY_MS = 3000; // Longer delay for rate limit recovery
 
 // Common schema for a Topic
 const TOPIC_SCHEMA = {
@@ -71,11 +70,12 @@ const ANALYSIS_SCHEMA = {
 };
 
 // Generation config with STRUCTURED OUTPUTS (Schema)
+// maxOutputTokens set to 65536 to prevent truncation (gemini-3-flash-preview supports up to 65536)
 const GENERATION_CONFIG = {
     temperature: 0,
     topP: 1,
     topK: 1,
-    maxOutputTokens: 8192,  // Increased to reliable limit
+    maxOutputTokens: 65536,
     responseMimeType: 'application/json' as const,
     responseSchema: ANALYSIS_SCHEMA,
 };
@@ -134,7 +134,7 @@ export async function analyzeTopics(
     const ai = getGenAI();
 
     // Filter out pure retweets
-    const originalTweets = tweets.filter(t => !t.isRetweet);
+    let originalTweets = tweets.filter(t => !t.isRetweet);
 
     if (originalTweets.length === 0) {
         return {
@@ -144,6 +144,15 @@ export async function analyzeTopics(
             categoryInsight: 'No original tweets found in this analysis window.',
             analyzedAt: new Date().toISOString(),
         };
+    }
+
+    // Cap at 25 tweets (sorted by engagement) to keep output within token limits
+    // This prevents JSON truncation by reducing how much the model needs to output
+    if (originalTweets.length > 25) {
+        originalTweets = originalTweets
+            .sort((a, b) => (b.likes + b.retweets + b.replies) - (a.likes + a.retweets + a.replies))
+            .slice(0, 25);
+        console.log(`[Gemini] Capped to top 25 tweets by engagement (from ${tweets.length})`);
     }
 
     // Deduplicate previous topic names (remove near-duplicates)
@@ -161,22 +170,29 @@ export async function analyzeTopics(
             try {
                 console.log(`[Gemini] Trying ${modelName} (attempt ${attempt}/${MAX_RETRIES})...`);
 
+                // Create model instance with specific config for EACH attempt
                 const model = ai.getGenerativeModel({
                     model: modelName,
-                    generationConfig: GENERATION_CONFIG,
+                    generationConfig: {
+                        ...GENERATION_CONFIG,
+                        responseSchema: ANALYSIS_SCHEMA,
+                        responseMimeType: 'application/json',
+                    },
                 });
                 const result = await model.generateContent(prompt);
-                const text = result.response.text();
 
-                // Parse JSON — no regex needed with Structured Outputs, but safe check
-                let jsonStr = text;
-                // Sometimes it might still wrap in markdown if it ignores schema (rare but possible)
-                const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-                if (jsonMatch) {
-                    jsonStr = jsonMatch[1].trim();
+                // Check if output was truncated (finishReason !== 'STOP')
+                const candidate = result.response.candidates?.[0];
+                const finishReason = candidate?.finishReason;
+                if (finishReason && finishReason !== 'STOP') {
+                    console.warn(`[Gemini] ⚠️ Output truncated (finishReason: ${finishReason}). Retrying...`);
+                    throw new Error(`Output truncated: finishReason=${finishReason}`);
                 }
 
-                const parsed = JSON.parse(jsonStr) as AnalysisResult;
+                const text = result.response.text();
+
+                // Advanced JSON Parsing with Cleanup
+                const parsed = tryParseJSON(text);
                 parsed.analyzedAt = new Date().toISOString();
 
                 console.log(`[Gemini] ✅ Analysis succeeded with ${modelName}`);
@@ -201,34 +217,35 @@ export async function analyzeTopics(
                     );
                     break;
 
-                } else if (isQuotaError && isLastModel) {
-                    console.error(
-                        `[Gemini] ❌ All models exhausted. Quota fully used up.\n` +
-                        `  → Check https://ai.google.dev/ for your usage.\n` +
-                        `  → Consider upgrading to a paid plan.`
-                    );
+                } else if (!isQuotaError) {
+                    // Start simplified prompt retry logic for Parsing Errors
+                    console.error(`[Gemini] Error with ${modelName}:`, error.message);
+                }
+
+                if (isQuotaError && isLastModel) {
+                    // ... (Quota exhausted logic) ...
+                    console.error(`[Gemini] ❌ All models exhausted.`);
                     return {
                         hotTopics: [],
                         emergingSignals: [],
                         peakingTopics: [],
-                        categoryInsight: '⚠️ Gemini API quota exhausted. Analysis will resume when quota resets.',
+                        categoryInsight: '⚠️ Gemini API quota exhausted.',
                         analyzedAt: new Date().toISOString(),
                     };
-
-                } else {
-                    console.error(`[Gemini] Error with ${modelName}:`, error.message);
-                    if (isLastAttempt && isLastModel) {
-                        return {
-                            hotTopics: [],
-                            emergingSignals: [],
-                            peakingTopics: [],
-                            categoryInsight: `Analysis failed: ${error.message}`,
-                            analyzedAt: new Date().toISOString(),
-                        };
-                    }
-                    if (isLastAttempt) break;
-                    await sleep(BASE_RETRY_DELAY_MS);
                 }
+
+                if (isLastAttempt && isLastModel) {
+                    return {
+                        hotTopics: [],
+                        emergingSignals: [],
+                        peakingTopics: [],
+                        categoryInsight: `Analysis failed: ${error.message}`,
+                        analyzedAt: new Date().toISOString(),
+                    };
+                }
+
+                if (isLastAttempt) break;
+                await sleep(BASE_RETRY_DELAY_MS);
             }
         }
     }
@@ -240,6 +257,36 @@ export async function analyzeTopics(
         categoryInsight: 'Analysis could not be completed.',
         analyzedAt: new Date().toISOString(),
     };
+}
+
+/**
+ * Robust JSON parser that attempts to fix common Gemini syntax errors.
+ */
+function tryParseJSON(text: string): AnalysisResult {
+    let jsonStr = text;
+    // Extract from markdown block if present
+    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) {
+        jsonStr = jsonMatch[1].trim();
+    }
+
+    try {
+        return JSON.parse(jsonStr) as AnalysisResult;
+    } catch (e) {
+        // Fix 1: Quote unquoted keys (e.g. { name: "foo" } -> { "name": "foo" })
+        // Look for word characters followed by colon, not inside quotes
+        let fixed = jsonStr.replace(/([{,]\s*)([a-zA-Z0-9_]+?)\s*:/g, '$1"$2":');
+
+        // Fix 2: Remove trailing commas
+        fixed = fixed.replace(/,(\s*[}\]])/g, '$1');
+
+        try {
+            return JSON.parse(fixed) as AnalysisResult;
+        } catch (e2) {
+            console.error('[Gemini] JSON parse failed even after cleanup:', e2);
+            throw e; // Throw original error
+        }
+    }
 }
 
 // ============================================================
@@ -298,8 +345,8 @@ ${previousTopicsSection}
 ${JSON.stringify(tweetData, null, 2)}
 
 ## METRICS EXPLANATION
-- **performanceMultiplier**: Tweet performance vs. expected for account size (1.0=normal, 2.0=2x better, 3.0+=viral signal)
-- **engagementRate**: (likes + RTs + replies + bookmarks) / followers × 100
+- **performanceMultiplier**: Tweet performance vs. expected (1.0=normal, 2.0=2x better, 3.0+=viral)
+- **engagementRate**: (interactions / followers) * 100
 - Multiple influencers on same topic = strong trend signal
 - A topic needs 2+ independent influencers to be considered genuine
 

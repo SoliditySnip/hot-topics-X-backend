@@ -339,6 +339,57 @@ export async function getRecentTweetsForAnalysis(category: string, hoursBack: nu
 }
 
 /**
+ * Get tweets that need their engagement metrics refreshed.
+ * Strategy: Fetch tweets from last 24h.
+ * Prioritize:
+ * 1. Tweets that already have > 10 likes (showing promise)
+ * 2. Tweets posted in the last 6 hours (give them a chance to pop)
+ */
+export async function getTweetsNeedingRefresh(hoursBack: number = 24) {
+    const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabase
+        .from('tweets')
+        .select(`
+            id,
+            tweet_id,
+            posted_at,
+            engagement_snapshots (
+                likes,
+                snapshot_at
+            )
+        `)
+        .gte('posted_at', since)
+        .order('posted_at', { ascending: false });
+
+    if (error) {
+        console.error('[DB] Error fetching refreshing candidates:', error);
+        return [];
+    }
+
+    // Filter in-memory for simpler logic
+    const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000;
+
+    return (data || []).map(tweet => {
+        const latestSnapshot = tweet.engagement_snapshots
+            ?.sort((a: any, b: any) => new Date(b.snapshot_at).getTime() - new Date(a.snapshot_at).getTime())[0];
+
+        const likes = latestSnapshot?.likes || 0;
+        const postedAtInfo = new Date(tweet.posted_at).getTime();
+
+        // Keep if: High engagement OR Very new (< 2 hours)
+        const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+        const needsRefresh = (likes > 100) || (postedAtInfo > twoHoursAgo);
+
+        return needsRefresh ? { id: tweet.tweet_id, likes } : null;
+    }).filter(item => item !== null)
+        // Sort by likes descending, take top 20 only
+        .sort((a: any, b: any) => b.likes - a.likes)
+        .slice(0, 20)
+        .map((item: any) => item.id) as string[];
+}
+
+/**
  * Save detected hot topics to the database.
  */
 export async function saveHotTopics(topics: any[], category: string) {
