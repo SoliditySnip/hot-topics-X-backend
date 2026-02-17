@@ -269,7 +269,7 @@ export async function takeEngagementSnapshots(tweets: FetchedTweet[]) {
  * Get recent tweets with their latest engagement data for AI analysis.
  * Fetches tweets from the last N hours with their best engagement snapshot.
  */
-export async function getRecentTweetsForAnalysis(category: string, hoursBack: number = 6) {
+export async function getRecentTweetsForAnalysis(category: string, hoursBack: number = 24) { // Increased to 24h to capture full viral lifecycle
     const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
 
     const { data, error } = await supabase
@@ -315,6 +315,7 @@ export async function getRecentTweetsForAnalysis(category: string, hoursBack: nu
 
     // For each tweet, use the latest snapshot for engagement data
     return (data || []).map(tweet => {
+        // Sort safely by date string comparison which is reliable for ISO strings
         const latestSnapshot = tweet.engagement_snapshots
             ?.sort((a: any, b: any) => new Date(b.snapshot_at).getTime() - new Date(a.snapshot_at).getTime())[0];
 
